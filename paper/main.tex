@@ -1,0 +1,427 @@
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithm}
+\usepackage[noend]{algpseudocode}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{url}
+\usepackage[hidelinks]{hyperref}
+
+% ---- markers that must be resolved before submission (grep for them) ----
+\newcommand{\verify}[1][]{\textbf{[VERIFY#1]}}
+\newcommand{\meas}{\textit{[meas.]}}
+\newcolumntype{L}[1]{>{\raggedright\arraybackslash}p{#1}}
+
+% float placement: let wide floats share pages
+\renewcommand{\topfraction}{0.9}
+\renewcommand{\dbltopfraction}{0.9}
+\renewcommand{\textfraction}{0.07}
+\renewcommand{\floatpagefraction}{0.85}
+\renewcommand{\dblfloatpagefraction}{0.85}
+\setcounter{topnumber}{3}
+\setcounter{dbltopnumber}{3}
+\setlength{\textfloatsep}{7pt plus 2pt minus 2pt}
+\setlength{\dbltextfloatsep}{7pt plus 2pt minus 2pt}
+\setlength{\floatsep}{5pt plus 2pt minus 2pt}
+\setlength{\dblfloatsep}{5pt plus 2pt minus 2pt}
+
+\begin{document}
+
+\title{Validated, Event-Driven SMS Location Reporting\\for a Low-Cost GPS--GSM Vehicle Tracking Node}
+
+\author{
+\IEEEauthorblockN{Rithikkaa S J}
+\IEEEauthorblockA{\textit{Dept. of Electronics and Communication Engineering}\\
+\textit{Amrita Vishwa Vidyapeetham}\\
+Chennai, India\\
+rithusj17@gmail.com}
+\and
+\IEEEauthorblockN{Rahul S G}
+\IEEEauthorblockA{\textit{Dept. of Electronics and Communication Engineering}\\
+\textit{Amrita Vishwa Vidyapeetham}\\
+Chennai, India\\
+sg\_rahul@ch.amrita.edu}
+}
+
+\maketitle
+
+\begin{abstract}
+SMS-based GPS--GSM trackers remain useful where mobile data coverage is intermittent, yet many low-cost designs forward whatever the receiver last produced, without checking fix validity or confirming that the reply left the modem. We start from a working Arduino Mega~2560, u-blox NEO-6M and SIM900A prototype that answered SMS location requests with a map link in a demonstration. A code-level review of its documented firmware identified six defect classes, including a UART conflict with the USB bridge, missing fix-quality checks and unbounded blocking loops. We propose an enhanced node with (i)~multi-criterion NMEA fix validation (checksum, RMC status, GGA quality, satellite count, HDOP and a kinematic gate); (ii)~event-driven reporting that combines displacement, course and heartbeat triggers with geofence, impact and SOS alerts; and (iii)~acknowledgement-aware SMS transmission with bounded retries and an EEPROM queue. A reference firmware implementing these functions compiles to 19.9~kB of flash and 1.8~kB of static RAM. We also define a measurement protocol covering time to first fix, CEP50/R95 error, decomposed request-to-reply latency, delivery ratio and a trace-driven comparison of reporting policies.
+\end{abstract}
+
+\begin{IEEEkeywords}
+GPS, GSM, SMS, vehicle tracking, NMEA 0183, fix validation, geofencing, event-driven reporting, embedded systems.
+\end{IEEEkeywords}
+
+% =====================================================================
+\section{Introduction}
+Vehicle trackers built from a GNSS receiver, a cellular modem and a microcontroller are now cheap enough to assemble from hobbyist modules~\cite{morallo2021,moumen2023}. Answering an SMS request with the current coordinates needs no data plan or server, but SMS is best-effort, with no guarantee of delivery or delivery time~\cite{pries2006}. A tracker that relies on it should know whether its position is trustworthy and whether its message was accepted. Low-cost designs rarely address either point.
+
+This work began as a prototype of exactly this kind, an Arduino Mega~2560 with a NEO-6M receiver and a SIM900A modem that answers an SMS request with a map link. We use it as a baseline and ask four questions.
+\textbf{RQ1:} how often does a fix pass explicit validity criteria, and with what horizontal error? \textbf{RQ2:} how is request-to-reply delay split between fix acquisition, processing, modem submission and network delivery? \textbf{RQ3:} how reliably are replies and alerts delivered, and how much do retries help? \textbf{RQ4:} how many messages does event-driven reporting save over fixed-interval reporting, and at what cost in tracking error?
+The contributions are:
+\begin{enumerate}
+\item a documented baseline node with a demonstrated request--reply cycle, and a code-level analysis of six defect classes in its firmware (Section~\ref{sec:existing});
+\item an enhanced architecture that adds fix validation, geofence, impact and SOS events, adaptive reporting and acknowledgement-aware transmission using one extra low-cost sensor (Sections~\ref{sec:arch}--\ref{sec:hw});
+\item a reference ATmega2560 firmware with integer coordinate arithmetic and non-blocking modem handling (Section~\ref{sec:alg});
+\item a measurement protocol with explicit metrics and an experiment plan for RQ1--RQ4, including trace-driven replay so that reporting policies are compared on identical tracks (Section~\ref{sec:exp}).
+\end{enumerate}
+The enhanced firmware is compiled but not yet hardware-tested.
+
+% =====================================================================
+\section{Related Work}
+\textit{On-demand SMS trackers.} Morallo~\cite{morallo2021} sends GPS coordinates by SMS from an Arduino Uno and SIM900A for viewing in Google Maps, which is the same functional architecture as our baseline. Our original project report drew on it and on~\cite{tummanapally2021}. Moumen \textit{et al.}~\cite{moumen2023} replace the SMS path with a SIM800L link to a Node.js/Firebase web interface.
+
+\textit{Emergency detection and geofencing.} Divi \textit{et al.}~\cite{divi2023} combine vibration and tilt sensing with alcohol detection and SMS alerts. WreckWatch~\cite{white2011} showed that acceleration thresholds alone cause false alarms unless combined with context; eCall~\cite{ecall2015} is the reference for automatic crash notification. Perusomula \textit{et al.}~\cite{perusomula2023} generate geofence and overspeed SMS alerts on an Arduino Mega, and Alvarico \textit{et al.}~\cite{alvarico2024} notify residents when a vehicle enters a set radius. Their summaries do not say how boundary chatter from position noise is handled, which motivates our hysteresis rule (Section~\ref{sec:events}).
+
+\textit{Adaptive reporting, SMS reliability and GNSS quality.} Rate-adaptive positioning~\cite{paek2010} and EnTracked~\cite{kjaergaard2009} schedule sampling from motion and accuracy needs to save energy; we apply the principle to SMS count. SMS delays on public networks range from seconds to much longer under load, with occasional loss~\cite{pries2006,zerfos2006}. Low-cost receivers are sensitive to multipath and obstruction~\cite{hamza2024}, so validation should use the receiver's own quality indicators.
+
+% =====================================================================
+\section{System Architecture}\label{sec:arch}
+
+
+
+\subsection{Existing System}\label{sec:existing}
+The baseline (Fig.~\ref{fig:enh}, unshaded blocks) consists of an Arduino Mega~2560, a NEO-6M module with a patch antenna and a SIM900A modem board, powered over USB. In the recorded demonstration (Fig.~\ref{fig:proto}), a handset sent ``Get location'' and the node replied with a URL of the form \url{maps.google.com/maps?q=loc:<lat>,<lon>} in five-decimal degrees, which resolved to the institute library.
+
+\begin{figure}[!t]
+\centering
+\includegraphics[width=0.8\columnwidth]{figs/fig6_prototype.jpg}
+\caption{Baseline prototype (left: Arduino Mega~2560, SIM900A board, NEO-6M with patch antenna) and the request--reply exchange recorded on the user's handset (right; sender header cropped).}
+\label{fig:proto}
+\end{figure}
+
+The documented firmware listing cannot have produced this behaviour. We therefore treat the demonstration as the only evidence of implemented function and the listing as a record of design intent. The firmware that ran during the demonstration was not preserved. The listing still reveals defect classes common in low-cost trackers (Table~\ref{tab:defects}), and the enhanced design addresses each of them.
+
+\begin{table}[!t]
+\caption{Defects Identified in the Documented Baseline Firmware Listing}
+\label{tab:defects}
+\centering
+\scriptsize
+\begin{tabular}{@{}L{0.32cm}L{3.85cm}L{3.3cm}@{}}
+\toprule
+ & Observation in listing & Consequence / remedy \\
+\midrule
+D1 & GSM declared as \texttt{SoftwareSerial(0,1)}; D0/D1 are wired to the USB--serial bridge. & Contention with upload and debug traffic; move modem to UART1. \\
+D2 & GPS declared as \texttt{SoftwareSerial(17,16)}; on the Mega, software-serial RX works only on pin-change pins~\cite{arduinoss}, and D17 is not one. & Receiver data not read; use hardware UART2 on the same pins. \\
+D3 & Fix accepted if a \texttt{\$GPGGA} line exceeds 65 characters; no checksum or fix-quality check. & Validity inferred from length; replaced by Eq.~\eqref{eq:valid}. \\
+D4 & Latitude/longitude copied as raw \texttt{ddmm.mmmm} text into the map URL; hemisphere ignored. & Map service misreads coordinates; convert with Eq.~\eqref{eq:dd}. \\
+D5 & \texttt{while(1)} GPS reader without timeout; global index shared across functions. & Node hangs without GPS data and cannot serve SMS; non-blocking parser. \\
+D6 & \texttt{gsm\_init()}, \texttt{send\_data()}, \texttt{send\_sms()} empty; request matched case-sensitively on the USB port. & No AT handling or delivery confirmation; link manager (Sec.~\ref{sec:comm}). \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Proposed Enhanced System}
+Fig.~\ref{fig:enh} shows the enhanced node. The signal chain is unchanged, so the work concentrates on what happens between parsing and transmission. A fix validator decides whether a position may be used at all. An event layer (request handler, geofence monitor, impact/SOS detector and reporting policy) decides when a message is warranted. An arbiter orders concurrent events by priority, and a GSM link manager establishes whether the message actually left the modem. Of these, only the NEO-6M/SIM900A request--reply path was demonstrated. The validation, event, reporting and link-management functions are implemented in the reference firmware but not yet tested on hardware, and the IMU, SOS button and modem supply are proposed hardware.
+
+\begin{figure*}[!t]
+\centering
+\includegraphics[width=0.94\textwidth]{figs/fig5_enhanced.pdf}
+\caption{Enhanced system architecture. Unshaded blocks are unchanged from the baseline, solid shaded blocks are reworked baseline functions, and dashed shaded blocks are new modules still to be validated on hardware.}
+\label{fig:enh}
+\end{figure*}
+
+
+
+\subsection{Hardware Components}
+The node uses an Arduino Mega~2560 (ATmega2560: 256~kB flash, 8~kB SRAM, 4~kB EEPROM, four USARTs~\cite{atmega2560}), a u-blox NEO-6M GPS L1 receiver (datasheet TTFF 1~s hot and 27~s cold, 2.5~m CEP~\cite{ublox6ds}; these are manufacturer figures, not measurements) and a SIM900A GSM 900/1800~MHz modem driven by AT commands~\cite{sim900at}. The new parts are an MPU-6050 accelerometer~\cite{mpu6050}, an SOS push-button, and a 12~V-to-5~V buck converter with bulk capacitance for the modem.
+
+\subsection{Software Architecture}
+The firmware is a cooperative, non-blocking loop. Each iteration drains the receiver UART, services modem lines, polls the SOS input and the IMU at 100~Hz, and evaluates the geofence and reporting rules. Modem waits keep draining the GPS buffer. Coordinates are stored as 32-bit integers in $10^{-7}$ degrees. This matters because \texttt{double} on AVR is a 32-bit IEEE-754 type: near $80^\circ$ longitude its spacing is $2^{-17}\approx7.6\times10^{-6}$ degrees, about 0.83~m at the test latitude.
+
+\subsection{Communication Architecture}\label{sec:comm}
+The modem runs in SMS text mode (\texttt{AT+CMGF=1}) with new-message indications (\texttt{AT+CNMI}), so a request raises an unsolicited \texttt{+CMTI} line instead of requiring polling~\cite{sim900at}. In an on-demand request (Fig.~\ref{fig:seq}A), the node reads the message, checks the sender against a whitelist, waits for a validated fix and replies with \texttt{AT+CMGS}. In an event-driven alert (B), it attaches the last valid fix and uses the same transmission path. Timestamps $t_0$--$t_5$ define the latency components of Eq.~\eqref{eq:lat}.
+
+\begin{figure*}[!t]
+\centering
+\includegraphics[width=0.94\textwidth]{figs/fig4_sequence.pdf}
+\caption{Communication sequence between vehicle events, GPS receiver, MCU, modem, cellular network and user handset: (A)~on-demand request and reply; (B)~proposed event-driven alert, summarised. Timestamps $t_0$--$t_5$ define the latency components in Eq.~\eqref{eq:lat}.}
+\label{fig:seq}
+\end{figure*}
+
+% =====================================================================
+\section{Methodology}\label{sec:method}
+
+\subsection{GPS Data Acquisition}
+The receiver streams NMEA~0183~\cite{nmea0183} at 9600~bit/s and 1~Hz. The firmware uses \texttt{RMC} (status, position, speed, course, UTC) and \texttt{GGA} (fix quality, satellites, HDOP).
+
+\subsection{GPS Data Processing}
+A field $\mathtt{ddmm.mmmmm}$ (longitude: $\mathtt{dddmm.mmmmm}$) with degrees $D$, minutes $M$ and hemisphere $h$ converts to signed decimal degrees as
+\begin{equation}
+\phi = s_h\left(D + \frac{M}{60}\right),\qquad s_h=\begin{cases}+1 & h\in\{\mathrm{N},\mathrm{E}\}\\ -1 & h\in\{\mathrm{S},\mathrm{W}\}\end{cases}
+\label{eq:dd}
+\end{equation}
+which is evaluated in integer arithmetic. The distance between fixes $(\phi_1,\lambda_1)$ and $(\phi_2,\lambda_2)$ follows the haversine formula~\cite{sinnott1984}:
+\begin{equation}
+d = 2R\arcsin\sqrt{\sin^2\frac{\Delta\phi}{2} + \cos\phi_1\cos\phi_2\sin^2\frac{\Delta\lambda}{2}}
+\label{eq:hav}
+\end{equation}
+where $R=6\,371\,008.8$~m and $\Delta\phi$, $\Delta\lambda$ are in radians. Offline evaluation uses Eq.~\eqref{eq:hav} in double precision. On the MCU, short distances use local east/north offsets about $(\phi_0,\lambda_0)$:
+\begin{equation}
+e = R\,\Delta\lambda\cos\phi_0,\qquad n = R\,\Delta\phi,\qquad d\approx\sqrt{e^2+n^2}
+\label{eq:enu}
+\end{equation}
+
+\subsection{Location Validation}
+A candidate fix $k$ is accepted only if
+\begin{equation}
+\begin{aligned}
+V_k = {}& [\mathrm{CS}_k] \wedge [\mathrm{RMC}_k{=}\mathrm{A}] \wedge [q_k \geq 1] \wedge [N^{\mathrm{sat}}_k \geq N_{\min}]\\
+& \wedge [\mathrm{HDOP}_k \leq H_{\max}] \wedge \left[\frac{d(\mathbf{p}_k,\mathbf{p}_{k-1})}{t_k - t_{k-1}} \leq v_{\max}\right]
+\end{aligned}
+\label{eq:valid}
+\end{equation}
+where $\mathrm{CS}_k$ denotes a correct XOR checksum, $q_k$ the GGA fix quality and $N^{\mathrm{sat}}_k$ the number of satellites used. The last term is a plausibility gate against the previous accepted fix. A fix older than $T_{\mathrm{stale}}$ is reported with its age rather than silently reused, and each rejection is logged with its reason.
+
+\subsection{Event Detection}\label{sec:events}
+\textit{Geofence and unauthorised movement.} For a circular fence with centre $\mathbf{c}$ and radius $r$, the node changes state with hysteresis $h$ after $N_f$ consecutive fixes:
+\begin{equation}
+\begin{aligned}
+\text{in}\rightarrow\text{out}:&\;\; d(\mathbf{p}_j,\mathbf{c}) > r+h,\;\; j=k-N_f+1,\dots,k\\
+\text{out}\rightarrow\text{in}:&\;\; d(\mathbf{p}_j,\mathbf{c}) < r-h,\;\; j=k-N_f+1,\dots,k
+\end{aligned}
+\label{eq:fence}
+\end{equation}
+An alert is sent only on the in-to-out transition; without hysteresis, position noise near the boundary would trigger repeated alerts. The \textsc{ARM} command places a small fence at the current position, turning the rule into unauthorised-movement detection.
+
+\textit{Impact and SOS.} With accelerations $a_x,a_y,a_z$ from the MPU-6050, an impact candidate is raised when
+\begin{equation}
+\|\mathbf{a}\| = \sqrt{a_x^2+a_y^2+a_z^2} > A_{\mathrm{th}}
+\label{eq:imp}
+\end{equation}
+and is confirmed only if the vehicle is stationary ($v<v_{\mathrm{stop}}$) or has no fix after a window $T_{\mathrm{conf}}$. This rejects pothole shocks while moving; $A_{\mathrm{th}}$ and $T_{\mathrm{conf}}$ are calibrated in E5. Holding the SOS button for 2~s raises an alert directly.
+
+\subsection{Communication and SMS Transmission}
+A message reads \texttt{<EVENT> <lat>,<lon> age=<s> hdop=<x> sat=<n>} followed by a map URL, within one 160-character segment. The node issues \texttt{AT+CMGS}, waits for the \texttt{>} prompt and sends the body and Ctrl-Z. It counts the message as submitted only if \texttt{+CMGS: <mr>} arrives within $T_{\mathrm{ack}}$ (Algorithm~\ref{alg:main}). Failures are retried after back-offs of $\{5,10,20\}$~s, with \texttt{AT+CSQ} logged before each retry, and after $N$ failures the event is queued in EEPROM until the link recovers. \texttt{+CMGS} confirms acceptance by the network, not delivery to the handset, so the delivery ratio must be measured at the handset.
+
+\subsection{Adaptive Reporting}
+With tracking enabled, a report is sent at fix $k$ if at least $T_{\min}$ has passed since the last report at fix $\ell$ and
+\begin{equation}
+\begin{aligned}
+&\left[d(\mathbf{p}_\ell,\mathbf{p}_k)\geq D_{\mathrm{th}}\right]\vee\left[t_k-t_\ell\geq T_{\max}\right]\\
+&\quad\vee\left[v_k\geq v_{\min}\wedge|\psi_k-\psi_\ell|\geq\Psi_{\mathrm{th}}\right]
+\end{aligned}
+\label{eq:trig}
+\end{equation}
+where $\psi$ is the course over ground, used only above $v_{\min}$. The heartbeat $T_{\max}$ shows that a parked node is alive.
+
+
+
+% =====================================================================
+\section{Hardware and Circuit Design}\label{sec:hw}
+
+\begin{figure*}[!t]
+\centering
+\includegraphics[width=0.94\textwidth]{figs/fig2_schematic.pdf}
+\caption{Hardware schematic of the vehicle tracking node. (a)~Baseline connections as declared in the firmware listing; module supply and logic levels were not documented. (b)~Proposed node: modem on UART1, receiver on UART2 with a 5~V-to-3.3~V divider on its RX input, MPU-6050 on I\textsuperscript{2}C, SOS button on D3, and a separate 5~V modem supply with bulk capacitance.}
+\label{fig:sch}
+\end{figure*}
+
+\subsection{Arduino Mega 2560}
+Fig.~\ref{fig:sch} shows the documented and proposed wiring. USART0 is kept for USB logging, USART1 (D18/D19) drives the modem and USART2 (D16/D17) the receiver, which removes D1 and D2 without moving the receiver's wires. The EEPROM holds the configuration, fence, alert queue and a 64-entry position history.
+
+\subsection{NEO-6M GPS Receiver}
+The breakout runs from 5~V through its regulator. Its 3.3~V RX input is driven from TX2 through a 1~k$\Omega$/2~k$\Omega$ divider; its 3.3~V TX output reaches RX2 directly with little margin above the input-high threshold~\cite{atmega2560}, so a level shifter is the conservative choice.
+
+\subsection{SIM900A GSM Modem}
+GSM bursts draw up to about 2~A, so powering the modem from the Mega's 5~V pin or USB risks brown-out resets. A dedicated buck converter with a 1000~\textmu F low-ESR reservoir feeds the module, with a common ground. The TTL header level varies between board variants and must match the MCU.
+
+\subsection{Additional Sensors}
+The MPU-6050 (GY-521) connects to D20/D21 at 400~kHz, with INT on D2. At $\pm16$~g one count is 1/2048~g~\cite{mpu6050}. It must be rigidly mounted, since a loose board registers its own rattle as impacts.
+
+% =====================================================================
+\section{Algorithm and Control Logic}\label{sec:alg}
+Algorithm~\ref{alg:main} summarises the control logic of the reference firmware.
+
+\begin{algorithm}[!t]
+\caption{Main loop of the enhanced tracking node}
+\label{alg:main}
+\scriptsize
+\begin{algorithmic}[1]
+\State init UART1/2, I\textsuperscript{2}C; load config from EEPROM
+\State \textsc{GsmInit}: AT, ATE0, CMGF=1, CNMI; wait CREG $\in\{1,5\}$
+\Loop
+  \While{GPS bytes available} \Comment{non-blocking}
+    \State assemble sentence $s$; \textbf{if} checksum fails \textbf{then} log, skip
+    \State \textbf{if} GGA \textbf{then} store $q, N^{\mathrm{sat}}, \mathrm{HDOP}$; \textbf{if} RMC \textbf{and} $V_k$ \textbf{then} $\mathbf{p}\gets\mathbf{p}_k$
+  \EndWhile
+  \If{modem line is \texttt{+CMTI}} read, delete; run command if sender whitelisted \EndIf
+  \If{SOS held $\geq$ 2~s} \textsc{Report}(SOS) \EndIf
+  \If{$\|\mathbf{a}\|>A_{\mathrm{th}}$} open window $T_{\mathrm{conf}}$ \EndIf
+  \If{window expired \textbf{and} ($v<v_{\mathrm{stop}}$ \textbf{or} no fix)} \textsc{Report}(IMPACT) \EndIf
+  \If{fence armed \textbf{and} Eq.~\eqref{eq:fence} gives in$\to$out} \textsc{Report}(FENCE) \EndIf
+  \If{tracking \textbf{and} Eq.~\eqref{eq:trig}} \textsc{Report}(TRK) \EndIf
+  \State periodically flush EEPROM queue
+\EndLoop
+\Function{Report}{$e$}
+  \For{$n=1$ \textbf{to} $N$}
+    \State \texttt{AT+CMGS}; await \texttt{>}; send body + 0x1A
+    \State wait \texttt{+CMGS} up to $T_{\mathrm{ack}}$ while draining GPS
+    \If{\texttt{+CMGS} received} update last report; \Return true \EndIf
+    \State wait back-off $b_n$; log \texttt{AT+CSQ}
+  \EndFor
+  \State queue $(e,\mathbf{p},t)$ in EEPROM; \Return false
+\EndFunction
+\end{algorithmic}
+\end{algorithm}
+
+Compiled with avr-gcc~7.3, the firmware occupies 19\,942~B of flash (7.6\%) and 1\,816~B of static RAM (22.2\%). Host-side unit tests confirmed that \texttt{1315.75900,N} and \texttt{08001.59420,E} decode to $13.2626500^\circ$ and $80.0265700^\circ$, matching the demonstration replies, and that sentences with a corrupted checksum are rejected. These tests verify arithmetic only.
+
+% =====================================================================
+\section{Experimental Setup and Results}\label{sec:exp}
+
+\subsection{Observed Behaviour of the Baseline}
+The demonstration record holds two complete exchanges, requested 25~min apart; the record does not show whether the node moved in between. They returned $(13.26265^\circ, 80.02657^\circ)$ and $(13.26265^\circ, 80.02658^\circ)$, which differ by $10^{-5}$ degrees of longitude. By Eq.~\eqref{eq:hav} that is 1.08~m, exactly one quantisation step of the five-decimal reply format. Two samples cannot characterise accuracy, the record gives send times only to the minute, and a third request appears without a visible reply. These gaps motivate the protocol below.
+
+\subsection{Experimental Protocol}
+Table~\ref{tab:params} defines five experiments. Device timestamps come from the firmware's USB event log; handset times $t_0$, $t_5$ come from an SMS export or a second modem on an NTP-synchronised PC. Raw NMEA is logged so routes can be replayed through any policy.
+
+\begin{table*}[!t]
+\caption{Experimental Parameters}
+\label{tab:params}
+\centering
+\scriptsize
+\begin{tabular}{@{}L{1.5cm}L{4.4cm}L{2.6cm}L{3.8cm}L{3.9cm}@{}}
+\toprule
+Exp. & Setup & Variable & Measured & Trials / analysis \\
+\midrule
+E1 Static & Antenna on a surveyed point at 3 sites (open sky, partial obstruction, near a building) & Sky view; cold/warm/hot start & TTFF; error (Eq.~\ref{eq:err}); HDOP; rejections by reason & $\geq$10 starts per type, $\geq$1~h per site; CEP50, R95, 2DRMS \\
+E2 Route & Vehicle on a campus route of known length; raw NMEA logged & Segment type & Path-length error; fix availability & $\geq$5 runs; replay through policies \\
+E3 Latency & Fixed position; requests from authorised handset & CSQ band; time of day & Components of Eq.~\eqref{eq:lat} & $\geq$100 requests; median, P95, ECDF \\
+E4 Reliability & As E3 with antenna detached, supply dip, SIM removed & Fault; retry on/off & Delivery ratio (Eq.~\ref{eq:pdr}); recovery time & $\geq$100 per condition; Wilson 95\% CI \\
+E5 Events & Fence around a parking bay; strikes on a rigid mount; SOS presses & $r, h, N_f$; $A_{\mathrm{th}}$ & Detection delay; false alerts/h; impact detections & $\geq$20 crossings, $\geq$30 strikes, $\geq$2~h driving \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\subsection{Metrics}
+For E1, with east/north errors $(e_i,n_i)$ of fix $i$ relative to the reference (Eq.~\ref{eq:enu}),
+\begin{equation}
+\begin{aligned}
+&\varepsilon_i=\sqrt{e_i^2+n_i^2},\qquad \mathrm{2DRMS}=2\sqrt{\sigma_e^2+\sigma_n^2},\\
+&\mathrm{CEP50}=\tilde{\varepsilon}_{0.50},\qquad \mathrm{R95}=\tilde{\varepsilon}_{0.95}
+\end{aligned}
+\label{eq:err}
+\end{equation}
+where $\tilde{\varepsilon}_q$ is the empirical $q$-quantile. Without a surveyed reference, the long-term mean is used and the result is reported as precision rather than accuracy. For E3, the end-to-end delay decomposes as
+\begin{equation}
+\begin{aligned}
+T_{\mathrm{e2e}} &= \underbrace{(t_1-t_0)}_{T_{\mathrm{in}}}+\underbrace{(t_2-t_1)}_{T_{\mathrm{fix}}}+\underbrace{(t_3-t_2)}_{T_{\mathrm{proc}}}\\
+&\quad+\underbrace{(t_4-t_3)}_{T_{\mathrm{tx}}}+\underbrace{(t_5-t_4)}_{T_{\mathrm{net}}}
+\end{aligned}
+\label{eq:lat}
+\end{equation}
+where $t_1$--$t_4$ use the device clock; $T_{\mathrm{in}}$ and $T_{\mathrm{net}}$ need synchronised clocks. For E4, the delivery ratio of $k$ delivered out of $n$ sent messages,
+\begin{equation}
+\hat{p}=k/n,
+\label{eq:pdr}
+\end{equation}
+is reported with a Wilson 95\% score interval~\cite{wilson1927}, which remains valid when $\hat{p}$ is close to 1.
+For RQ4, the message reduction of the adaptive policy (A) over periodic reporting (P) on the same trace, and the zero-order-hold error at fix $k$ given the latest report $\ell(k)$, are
+\begin{equation}
+\eta = 1-\frac{N_{\mathrm{A}}}{N_{\mathrm{P}}},\qquad \epsilon_k = d\!\left(\mathbf{p}_k,\mathbf{p}_{\ell(k)}\right)
+\label{eq:eta}
+\end{equation}
+summarised by the RMS and 95th percentile of $\epsilon_k$ over identical replayed traces.
+
+\IfFileExists{results_table.tex}{%
+\subsection{Measured Results}
+\input{results_table.tex}
+Table~\ref{tab:results} reports the static positioning (E1) and request-to-reply (E3) measurements, generated from the firmware logs by the released analysis script. E2, E4 and E5 are in progress.
+}{%
+\subsection{Planned Analysis}
+Results for E1--E4 will be reported per site and per signal-quality band: TTFF by start type, CEP50/R95/2DRMS with error CDFs, the median and P95 of each latency component in Eq.~\eqref{eq:lat}, delivery ratios with Wilson intervals with and without retries, and the SMS count against $\epsilon_{\mathrm{RMS}}$ for periodic intervals of 30--120~s and for the adaptive policy. An analysis script that computes every metric from the firmware log and the NMEA traces is released with the firmware.
+}
+
+% =====================================================================
+\section{Discussion}\label{sec:disc}
+The baseline's main weakness was not its hardware but its silence about the quality of what it sent: replies carried no fix age, HDOP or satellite count, and the node could not tell whether a reply had been accepted. The enhanced message carries this metadata. Unlike the reviewed designs~\cite{morallo2021,moumen2023,divi2023,perusomula2023,alvarico2024}, the node makes fix validation, hysteresis and transmission acknowledgement explicit and measurable. High rejection rates with a low R95 at obstructed sites would show that validation trades availability for trustworthiness (RQ1); the latency breakdown separates node delay from network delay (RQ2); and the adaptive policy is worthwhile only if it lies below the periodic SMS-count versus error curve (RQ4).
+
+% =====================================================================
+\section{Limitations}
+First, the enhanced firmware has been compiled and unit-tested but not run on the prototype, so its thresholds still need calibration. Second, the demonstration firmware was not preserved. Third, the SIM900A is 2G-only; an LTE-M or NB-IoT modem would change AT details but not the architecture. Fourth, strike tests give false-trigger rates but not real-collision detection rates. Finally, SMS sender IDs can be spoofed, so state-changing commands should require a PIN.
+
+% =====================================================================
+\section{Conclusion and Future Work}
+A basic GPS--GSM tracker behaves unpredictably because it does not validate fixes, does not handle modem responses and relies on blocking code. The enhanced node keeps the same low-cost signal chain and adds fix validation, event-driven reporting with geofence, impact and SOS triggers, and acknowledgement-aware transmission within the ATmega2560's resources. The next step is to run E1--E5 on the prototype. Planned extensions are SMS delivery reports and LTE-M/NB-IoT migration.
+
+% =====================================================================
+\section*{Acknowledgment}
+The authors thank Rohit P.\ and Rishivesh, who co-built the baseline prototype as part of the original course project.
+
+\begin{thebibliography}{99}
+\footnotesize
+
+\bibitem{morallo2021}
+N.~T. Morallo, ``Vehicle tracker system design based on GSM and GPS interface using Arduino as platform,'' \emph{Indonesian J. Elect. Eng. Comput. Sci.}, vol.~23, no.~1, pp.~258--264, Jul. 2021, doi: 10.11591/ijeecs.v23.i1.pp258-264.
+
+
+
+\bibitem{moumen2023}
+I.~Moumen \emph{et~al.}, ``Real-time GPS tracking system for IoT-enabled connected vehicles,'' \emph{E3S Web Conf. (ICIES 2023)}, Art. no.~01095, 2023.
+
+\bibitem{pries2006}
+R.~Pries, T.~Ho{\ss}feld, and P.~Tran-Gia, ``On the suitability of the short message service for emergency warning systems,'' in \emph{Proc. IEEE 63rd Veh. Technol. Conf. (VTC-Spring)}, 2006, pp.~991--995, doi: 10.1109/VETECS.2006.1682973.
+
+\bibitem{tummanapally2021}
+S.~S. Tummanapally and S.~Sunkari, ``Smart vehicle tracking system using GPS and GSM technologies,'' SSRN, 2021. [Online]. Available: \url{https://papers.ssrn.com/sol3/papers.cfm?abstract_id=3884903}
+
+\bibitem{divi2023}
+L.~K. Divi, N.~Neelima, Y.~S.~K. Gudela, and N.~R. Palaparti, ``Automatic alcohol sensing and vehicle accident detection system using GPS and GSM,'' in \emph{Proc. Int. Conf. Intell. Data Commun. Technol. Internet Things (IDCIoT)}, 2023, pp.~777--780, doi: 10.1109/IDCIoT56793.2023.10053555.
+
+\bibitem{white2011}
+J.~White, C.~Thompson, H.~Turner, B.~Dougherty, and D.~C. Schmidt, ``WreckWatch: Automatic traffic accident detection and notification with smartphones,'' \emph{Mobile Netw. Appl.}, vol.~16, no.~3, pp.~285--303, 2011, doi: 10.1007/s11036-011-0304-8.
+
+\bibitem{ecall2015}
+\emph{Regulation (EU) 2015/758 on Type-Approval Requirements for the Deployment of the eCall In-Vehicle System}, Off. J. Eur. Union, L 123, 2015.
+
+\bibitem{perusomula2023}
+H.~Perusomula, V.~Marriwada, S.~K. Vallepu, K.~Sesham, R.~C. Gudapati, and J.~Garikipati, ``Geo-fencing and overspeed alert SMS system,'' in \emph{Proc. 2nd Int. Conf. Electron. Renewable Syst. (ICEARS)}, 2023, pp.~584--589, doi: 10.1109/ICEARS56392.2023.10085114.
+
+\bibitem{alvarico2024}
+E.~A.~M. Alvarico, F.~A.~I. Arricivita, and F.~R.~G. Cruz, ``Real-time tracking and monitoring system with geofence notification for garbage collection vehicles,'' in \emph{Proc. 6th Int. Conf. Electron. Commun., Netw. Comput. Technol. (ECNCT)}, 2024, pp.~363--368, doi: 10.1109/ECNCT63103.2024.10704377.
+
+\bibitem{paek2010}
+J.~Paek, J.~Kim, and R.~Govindan, ``Energy-efficient rate-adaptive GPS-based positioning for smartphones,'' in \emph{Proc. 8th Int. Conf. Mobile Syst., Appl., Services (MobiSys)}, 2010, pp.~299--314, doi: 10.1145/1814433.1814463.
+
+\bibitem{kjaergaard2009}
+M.~B. Kj{\ae}rgaard \emph{et~al.}, ``EnTracked: Energy-efficient robust position tracking for mobile devices,'' in \emph{Proc. 7th Int. Conf. Mobile Syst., Appl., Services (MobiSys)}, 2009, doi: 10.1145/1555816.1555839.
+
+\bibitem{zerfos2006}
+P.~Zerfos \emph{et~al.}, ``A study of the short message service of a nationwide cellular network,'' in \emph{Proc. 6th ACM SIGCOMM Conf. Internet Meas. (IMC)}, 2006, doi: 10.1145/1177080.1177114.
+
+\bibitem{hamza2024}
+V.~Hamza, B.~Stopar, O.~Sterle, and P.~Pavlov{\v{c}}i{\v{c}}-Pre{\v{s}}eren, ``Observations and positioning quality of low-cost GNSS receivers: A review,'' \emph{GPS Solutions}, vol.~28, Art. no.~149, 2024, doi: 10.1007/s10291-024-01686-8.
+
+\bibitem{arduinoss}
+Arduino, ``SoftwareSerial library,'' Arduino Documentation. [Online]. Available: \url{https://docs.arduino.cc/learn/built-in-libraries/software-serial/} (accessed Oct. 3, 2026).
+
+\bibitem{ublox6ds}
+u-blox AG, ``NEO-6 u-blox 6 GPS modules data sheet,'' Doc. GPS.G6-HW-09005.
+
+\bibitem{atmega2560}
+Microchip Technology, ``ATmega640/V-1280/V-1281/V-2560/V-2561/V data sheet,'' DS40002211A, 2020.
+
+\bibitem{sim900at}
+SIMCom Wireless Solutions, ``SIM900 AT commands manual.''
+
+\bibitem{mpu6050}
+InvenSense Inc., ``MPU-6000 and MPU-6050 product specification,'' PS-MPU-6000A-00, rev.~3.4, 2013.
+
+\bibitem{nmea0183}
+National Marine Electronics Association, \emph{NMEA 0183 Standard for Interfacing Marine Electronic Devices}, ver.~4.10, 2012.
+
+\bibitem{sinnott1984}
+R.~W. Sinnott, ``Virtues of the haversine,'' \emph{Sky and Telescope}, vol.~68, no.~2, p.~159, 1984.
+
+\bibitem{wilson1927}
+E.~B. Wilson, ``Probable inference, the law of succession, and statistical inference,'' \emph{J. Amer. Statist. Assoc.}, vol.~22, no.~158, pp.~209--212, 1927.
+
+\end{thebibliography}
+
+\end{document}
