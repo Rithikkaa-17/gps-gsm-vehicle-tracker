@@ -50,6 +50,4 @@ python3 analysis/eval_tools.py latency --log e3.log --handset handset.csv
 python3 analysis/eval_tools.py replay  --nmea route.nmea --period 60 --dth 200
 ```
 
-## Authors
 
-Rithikkaa S J and Rahul S G, Dept. of Electronics and Communication Engineering, Amrita Vishwa Vidyapeetham, Chennai. The baseline prototype was co-built with Rohit P. and Rishivesh.
