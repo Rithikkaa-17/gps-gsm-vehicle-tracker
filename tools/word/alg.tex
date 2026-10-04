@@ -1,0 +1,41 @@
+\documentclass{article}
+\usepackage[paperwidth=3.5in,paperheight=10in,margin=0.04in]{geometry}
+\usepackage{mathptmx}
+\usepackage{amsmath,amssymb}
+\usepackage{algorithm}
+\usepackage[noend]{algpseudocode}
+\usepackage{float}
+\pagestyle{empty}
+\begin{document}
+\begin{algorithm}[H]
+\caption{Main loop of the enhanced tracking node}
+\label{alg:main}
+\scriptsize
+\begin{algorithmic}[1]
+\State init UART1/2, I\textsuperscript{2}C; load config from EEPROM
+\State \textsc{GsmInit}: AT, ATE0, CMGF=1, CNMI; wait CREG $\in\{1,5\}$
+\Loop
+  \While{GPS bytes available} \Comment{non-blocking}
+    \State assemble sentence $s$; \textbf{if} checksum fails \textbf{then} log, skip
+    \State \textbf{if} GGA \textbf{then} store $q, N^{\mathrm{sat}}, \mathrm{HDOP}$; \textbf{if} RMC \textbf{and} $V_k$ \textbf{then} $\mathbf{p}\gets\mathbf{p}_k$
+  \EndWhile
+  \If{modem line is \texttt{+CMTI}} read, delete; run command if sender whitelisted \EndIf
+  \If{SOS held $\geq$ 2~s} \textsc{Report}(SOS) \EndIf
+  \If{$\|\mathbf{a}\|>A_{\mathrm{th}}$} open window $T_{\mathrm{conf}}$ \EndIf
+  \If{window expired \textbf{and} ($v<v_{\mathrm{stop}}$ \textbf{or} no fix)} \textsc{Report}(IMPACT) \EndIf
+  \If{fence armed \textbf{and} Eq.~(5) gives in$\to$out} \textsc{Report}(FENCE) \EndIf
+  \If{tracking \textbf{and} Eq.~(7)} \textsc{Report}(TRK) \EndIf
+  \State periodically flush EEPROM queue
+\EndLoop
+\Function{Report}{$e$}
+  \For{$n=1$ \textbf{to} $N$}
+    \State \texttt{AT+CMGS}; await \texttt{>}; send body + 0x1A
+    \State wait \texttt{+CMGS} up to $T_{\mathrm{ack}}$ while draining GPS
+    \If{\texttt{+CMGS} received} update last report; \Return true \EndIf
+    \State wait back-off $b_n$; log \texttt{AT+CSQ}
+  \EndFor
+  \State queue $(e,\mathbf{p},t)$ in EEPROM; \Return false
+\EndFunction
+\end{algorithmic}
+\end{algorithm}
+\end{document}
